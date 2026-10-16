@@ -1,16 +1,52 @@
 import { spawn } from "node:child_process"
 import { readdir, readFile, stat } from "node:fs/promises"
 import path from "node:path"
-import { createMemo, createSignal, For, onMount, Show } from "solid-js"
-import type { MouseEvent as TuiMouseEvent } from "@opentui/core"
+import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js"
+import { useTerminalDimensions } from "@opentui/solid"
+import {
+  addDefaultParsers,
+  CliRenderEvents,
+  CodeRenderable,
+  isRenderable,
+  resolveRenderLib,
+  LineNumberRenderable,
+  pathToFiletype,
+  SyntaxStyle,
+  TextAttributes,
+  type BoxRenderable,
+  type FiletypeParserOptions,
+  type InputRenderable,
+  type MouseEvent as TuiMouseEvent,
+  type RGBA,
+  type ScrollBoxRenderable,
+} from "@opentui/core"
 import { Plugin, usePlugin } from "@opencode/plugin/tui"
+import { loadLocalGitInfo, type FileChange } from "./preview-git.js"
+import { findSearchMatches, searchPosition } from "./preview-search.js"
+
+// ---------------------------------------------------------------------------
+// File tree
+// ---------------------------------------------------------------------------
 
 const IGNORED_DIRECTORIES = new Set([".git", "node_modules", ".next", "dist", "build", "coverage", "target"])
 const MAX_DEPTH = 8
 const MAX_ENTRIES = 5000
 const MAX_ROWS = 45
-const MAX_FILE_SIZE = 1024 * 1024
+const MIN_ROWS = 4
+// Rows outside the tree itself: the host sidebar's outer padding, session
+// title, and footer slot (~5), plus this panel's "Files" label, root path,
+// hint line, and one blank row of breathing room (~4). The tree never grows
+// past these, so it cannot run flush against the bottom of the sidebar.
+const RESERVED_ROWS = 9
 const DOUBLE_CLICK_DELAY = 350
+
+// ---------------------------------------------------------------------------
+// File preview
+// ---------------------------------------------------------------------------
+
+const MAX_FILE_SIZE = 1024 * 1024
+const BINARY_SNIFF_LENGTH = 8000
+const STYLE_RELEASE_DELAY = 250
 
 type FileNode = {
   name: string
@@ -23,17 +59,23 @@ type VisibleNode = FileNode & {
   indent: number
 }
 
+type PreviewStatus = "loading" | "ready" | "binary" | "too-large" | "error"
+
 type FilePreview = {
   node: FileNode
+  status: PreviewStatus
   content: string
+  message?: string
+  sizeBytes: number
+  relativePath: string
   branch?: string
-  diff?: {
-    status: "added" | "deleted" | "modified"
-    additions: number
-    deletions: number
-    patch: string
-  }
+  change?: FileChange
+  gitMessage?: string
 }
+
+// ---------------------------------------------------------------------------
+// Clipboard
+// ---------------------------------------------------------------------------
 
 async function runClipboardCommand(command: string, args: string[], value: string): Promise<void> {
   await new Promise<void>((resolve, reject) => {
@@ -77,51 +119,905 @@ async function copyToClipboard(value: string): Promise<void> {
   throw lastError instanceof Error ? lastError : new Error("No clipboard command is available")
 }
 
+// ---------------------------------------------------------------------------
+// Git helpers
+// ---------------------------------------------------------------------------
+
 function normalizeGitPath(value: string): string {
   return value.replaceAll("\\", "/").replace(/^\.\//, "")
 }
 
-function FilePreviewDialog(props: { preview: () => FilePreview | undefined }) {
-  const current = () => props.preview()
+// ---------------------------------------------------------------------------
+// Syntax highlighting
+// ---------------------------------------------------------------------------
 
+// Tree-sitter grammars bundled with @opentui/core cover js/ts/jsx/tsx, markdown
+// and zig. Extra languages are registered OpenCode-style: the wasm and query
+// files are downloaded from these pinned URLs on first use and disk-cached.
+// Offline machines fall back to plain text; set FILE_TREE_NO_REMOTE_GRAMMARS=1
+// to skip registration entirely.
+const REMOTE_PARSERS: FiletypeParserOptions[] = [
+  {
+    filetype: "json",
+    wasm: "https://github.com/tree-sitter/tree-sitter-json/releases/download/v0.24.8/tree-sitter-json.wasm",
+    queries: {
+      highlights: [
+        "https://raw.githubusercontent.com/nvim-treesitter/nvim-treesitter/refs/heads/master/queries/json/highlights.scm",
+      ],
+    },
+  },
+  {
+    filetype: "bash",
+    wasm: "https://github.com/tree-sitter/tree-sitter-bash/releases/download/v0.25.0/tree-sitter-bash.wasm",
+    queries: {
+      highlights: [
+        "https://raw.githubusercontent.com/nvim-treesitter/nvim-treesitter/refs/heads/master/queries/bash/highlights.scm",
+      ],
+    },
+  },
+  {
+    filetype: "python",
+    wasm: "https://github.com/tree-sitter/tree-sitter-python/releases/download/v0.23.6/tree-sitter-python.wasm",
+    queries: {
+      highlights: [
+        "https://github.com/tree-sitter/tree-sitter-python/raw/refs/heads/master/queries/highlights.scm",
+      ],
+    },
+  },
+  {
+    filetype: "rust",
+    wasm: "https://github.com/tree-sitter/tree-sitter-rust/releases/download/v0.24.0/tree-sitter-rust.wasm",
+    queries: {
+      highlights: [
+        "https://raw.githubusercontent.com/nvim-treesitter/nvim-treesitter/refs/heads/master/queries/rust/highlights.scm",
+      ],
+    },
+  },
+  {
+    filetype: "go",
+    wasm: "https://github.com/tree-sitter/tree-sitter-go/releases/download/v0.25.0/tree-sitter-go.wasm",
+    queries: {
+      highlights: [
+        "https://raw.githubusercontent.com/nvim-treesitter/nvim-treesitter/refs/heads/master/queries/go/highlights.scm",
+      ],
+    },
+  },
+  {
+    filetype: "css",
+    wasm: "https://github.com/tree-sitter/tree-sitter-css/releases/download/v0.25.0/tree-sitter-css.wasm",
+    queries: {
+      highlights: [
+        "https://raw.githubusercontent.com/nvim-treesitter/nvim-treesitter/refs/heads/master/queries/css/highlights.scm",
+      ],
+    },
+  },
+  {
+    filetype: "yaml",
+    wasm: "https://github.com/tree-sitter-grammars/tree-sitter-yaml/releases/download/v0.7.2/tree-sitter-yaml.wasm",
+    queries: {
+      highlights: [
+        "https://raw.githubusercontent.com/nvim-treesitter/nvim-treesitter/refs/heads/master/queries/yaml/highlights.scm",
+      ],
+    },
+  },
+  {
+    filetype: "toml",
+    wasm: "https://github.com/tree-sitter-grammars/tree-sitter-toml/releases/download/v0.7.0/tree-sitter-toml.wasm",
+    queries: {
+      highlights: [
+        "https://raw.githubusercontent.com/nvim-treesitter/nvim-treesitter/master/queries/toml/highlights.scm",
+      ],
+    },
+  },
+]
+
+let remoteParsersRegistered = false
+
+function ensureRemoteParsers(): void {
+  if (remoteParsersRegistered) return
+  remoteParsersRegistered = true
+  if (process.env.FILE_TREE_NO_REMOTE_GRAMMARS) return
+  try {
+    addDefaultParsers(REMOTE_PARSERS)
+  } catch {
+    // Grammars unavailable — previews degrade to plain text.
+  }
+}
+
+/** Minimal structural copy of the OpenCode resolved-theme tokens this plugin reads. */
+interface PreviewTheme {
+  text: {
+    base: RGBA
+    muted: RGBA
+    action: Record<string, { base: RGBA }>
+    feedback: Record<string, { base: RGBA; muted: RGBA }>
+  }
+  background: {
+    base: RGBA
+    raised: { base: RGBA; high: RGBA; max: RGBA }
+  }
+  diff: {
+    text: { added: RGBA; removed: RGBA; context: RGBA; hunkHeader: RGBA }
+    background: { added: RGBA; removed: RGBA; context: RGBA }
+    highlight: { added: RGBA; removed: RGBA }
+    lineNumber: { text: RGBA; background: { added: RGBA; removed: RGBA } }
+  }
+  syntax: Record<string, RGBA>
+  markdown: Record<string, RGBA>
+  surface: (name: string) => PreviewTheme
+}
+
+/**
+ * Builds a SyntaxStyle from the active theme, mirroring the token mapping
+ * OpenCode itself uses (`generateSyntax` in @opencode/theme). This makes file
+ * previews match the colors of OpenCode's own code blocks and diff viewer.
+ */
+function buildSyntaxStyle(theme: PreviewTheme): SyntaxStyle {
+  const syntax = theme.syntax
+  const markdown = theme.markdown
+  const feedback = theme.text.feedback
+  return SyntaxStyle.fromStyles({
+    default: { fg: theme.text.base },
+    search: { fg: theme.background.base, bg: theme.text.action.primary.base, bold: true },
+    comment: { fg: syntax.comment, italic: true },
+    "comment.documentation": { fg: syntax.comment, italic: true },
+    string: { fg: syntax.string },
+    symbol: { fg: syntax.string },
+    character: { fg: syntax.string },
+    "character.special": { fg: syntax.string },
+    number: { fg: syntax.number },
+    boolean: { fg: syntax.number },
+    constant: { fg: syntax.number },
+    float: { fg: syntax.number },
+    keyword: { fg: syntax.keyword, italic: true },
+    "keyword.import": { fg: syntax.keyword },
+    "keyword.export": { fg: syntax.keyword },
+    "keyword.return": { fg: syntax.keyword, italic: true },
+    "keyword.conditional": { fg: syntax.keyword, italic: true },
+    "keyword.conditional.ternary": { fg: syntax.operator },
+    "keyword.repeat": { fg: syntax.keyword, italic: true },
+    "keyword.coroutine": { fg: syntax.keyword, italic: true },
+    "keyword.function": { fg: syntax.function },
+    "keyword.type": { fg: syntax.type, bold: true, italic: true },
+    "keyword.operator": { fg: syntax.operator },
+    "keyword.directive": { fg: syntax.keyword, italic: true },
+    "keyword.modifier": { fg: syntax.keyword, italic: true },
+    "keyword.exception": { fg: syntax.keyword, italic: true },
+    operator: { fg: syntax.operator },
+    punctuation: { fg: syntax.punctuation },
+    "punctuation.bracket": { fg: syntax.punctuation },
+    "punctuation.delimiter": { fg: syntax.operator },
+    "punctuation.special": { fg: syntax.operator },
+    variable: { fg: syntax.variable },
+    "variable.parameter": { fg: syntax.variable },
+    "variable.member": { fg: syntax.function },
+    "variable.builtin": { fg: feedback.error.base },
+    "variable.super": { fg: feedback.error.base },
+    parameter: { fg: syntax.variable },
+    field: { fg: syntax.variable },
+    property: { fg: syntax.variable },
+    function: { fg: syntax.function },
+    "function.builtin": { fg: feedback.error.base },
+    "function.call": { fg: syntax.variable },
+    "function.method": { fg: syntax.function },
+    "function.method.call": { fg: syntax.variable },
+    constructor: { fg: syntax.function },
+    type: { fg: syntax.type },
+    "type.builtin": { fg: feedback.error.base },
+    "type.definition": { fg: syntax.type, bold: true },
+    module: { fg: syntax.type },
+    "module.builtin": { fg: feedback.error.base },
+    class: { fg: syntax.type },
+    namespace: { fg: syntax.type },
+    "markup.heading": { fg: markdown.heading, bold: true },
+    "markup.heading.1": { fg: markdown.heading, bold: true, underline: true },
+    "markup.heading.2": { fg: markdown.heading, bold: true },
+    "markup.heading.3": { fg: markdown.heading, bold: true },
+    "markup.heading.4": { fg: markdown.heading, bold: true },
+    "markup.heading.5": { fg: markdown.heading, bold: true },
+    "markup.heading.6": { fg: markdown.heading, bold: true },
+    "markup.bold": { fg: markdown.strong, bold: true },
+    "markup.strong": { fg: markdown.strong, bold: true },
+    "markup.italic": { fg: markdown.emphasis, italic: true },
+    "markup.list": { fg: markdown.listItem },
+    "markup.list.checked": { fg: feedback.success.base },
+    "markup.list.unchecked": { fg: theme.text.muted },
+    "markup.quote": { fg: markdown.blockQuote, italic: true },
+    "markup.raw": { fg: markdown.code },
+    "markup.raw.block": { fg: markdown.code },
+    "markup.raw.inline": { fg: markdown.code, bg: theme.background.base },
+    "markup.link": { fg: markdown.link, underline: true },
+    "markup.link.url": { fg: markdown.link, underline: true },
+    "markup.link.label": { fg: markdown.linkText, underline: true },
+    "markup.underline": { fg: theme.text.base, underline: true },
+    "markup.strikethrough": { fg: theme.text.muted },
+    label: { fg: markdown.linkText },
+    spell: { fg: theme.text.base },
+    nospell: { fg: theme.text.base },
+    attribute: { fg: feedback.warning.base },
+    annotation: { fg: feedback.warning.base },
+    tag: { fg: feedback.error.base },
+    "tag.attribute": { fg: syntax.keyword },
+    "tag.delimiter": { fg: syntax.operator },
+    debug: { fg: theme.text.muted },
+    "comment.error": { fg: feedback.error.base, italic: true, bold: true },
+    "comment.warning": { fg: feedback.warning.base, italic: true, bold: true },
+    "comment.todo": { fg: feedback.info.base, italic: true, bold: true },
+    "comment.note": { fg: feedback.info.base, italic: true, bold: true },
+    "diff.plus": { fg: theme.diff.text.added, bg: theme.diff.background.added },
+    "diff.minus": { fg: theme.diff.text.removed, bg: theme.diff.background.removed },
+    "diff.delta": { fg: theme.diff.text.context, bg: theme.diff.background.context },
+    error: { fg: feedback.error.base, bold: true },
+    warning: { fg: feedback.warning.base, bold: true },
+    info: { fg: feedback.info.base },
+  })
+}
+
+/** Releases a SyntaxStyle after its renderables are gone. */
+function releaseSyntaxStyle(style: SyntaxStyle): void {
+  setTimeout(() => {
+    try {
+      style.destroy()
+    } catch {
+      // Renderer may already be gone.
+    }
+  }, STYLE_RELEASE_DELAY)
+}
+
+// ---------------------------------------------------------------------------
+// File utilities
+// ---------------------------------------------------------------------------
+
+const LANGUAGE_NAMES: Record<string, string> = {
+  bash: "Shell Script",
+  c: "C",
+  clojure: "Clojure",
+  cpp: "C++",
+  csharp: "C#",
+  css: "CSS",
+  dart: "Dart",
+  diff: "Diff",
+  dockerfile: "Dockerfile",
+  elixir: "Elixir",
+  elm: "Elm",
+  erlang: "Erlang",
+  fsharp: "F#",
+  go: "Go",
+  groovy: "Groovy",
+  handlebars: "Handlebars",
+  haskell: "Haskell",
+  html: "HTML",
+  ini: "INI",
+  java: "Java",
+  javascript: "JavaScript",
+  javascriptreact: "JavaScript JSX",
+  json: "JSON",
+  julia: "Julia",
+  kotlin: "Kotlin",
+  latex: "LaTeX",
+  less: "Less",
+  lua: "Lua",
+  make: "Makefile",
+  markdown: "Markdown",
+  ocaml: "OCaml",
+  perl: "Perl",
+  php: "PHP",
+  powershell: "PowerShell",
+  python: "Python",
+  r: "R",
+  ruby: "Ruby",
+  rust: "Rust",
+  sass: "Sass",
+  scala: "Scala",
+  scss: "SCSS",
+  svelte: "Svelte",
+  swift: "Swift",
+  toml: "TOML",
+  typescript: "TypeScript",
+  typescriptreact: "TypeScript TSX",
+  vim: "Vim",
+  vue: "Vue",
+  xml: "XML",
+  yaml: "YAML",
+  zig: "Zig",
+}
+
+function languageName(filetype: string | undefined): string {
+  if (!filetype) return "Plain Text"
+  return LANGUAGE_NAMES[filetype] ?? filetype.charAt(0).toUpperCase() + filetype.slice(1)
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+}
+
+function countLines(content: string): number {
+  if (!content) return 0
+  return content.split("\n").length
+}
+
+function detectEol(content: string): "LF" | "CRLF" {
+  return content.includes("\r\n") ? "CRLF" : "LF"
+}
+
+function isBinaryContent(content: string): boolean {
+  return content.slice(0, BINARY_SNIFF_LENGTH).includes("\u0000")
+}
+
+// ---------------------------------------------------------------------------
+// Preview components
+// ---------------------------------------------------------------------------
+
+/**
+ * Syntax-highlighted file content with a VSCode-style line-number gutter.
+ *
+ * CodeRenderable + LineNumberRenderable are built imperatively: the gutter
+ * must adopt the code renderable as its target at construction time, and JSX
+ * prop assignment cannot express that safely (it would bypass setTarget and
+ * break teardown). The pair is destroyed explicitly on cleanup.
+ */
+function CodePane(props: {
+  theme: PreviewTheme
+  content: () => string
+  filetype: () => string | undefined
+  searchQuery: () => string
+  activeMatch: () => [number, number] | undefined
+  scroll: () => ScrollBoxRenderable | undefined
+}) {
+  const context = usePlugin()
+  let host: BoxRenderable | undefined
+  let built: { wrapper: LineNumberRenderable; code: CodeRenderable; style: SyntaxStyle } | undefined
+
+  const teardown = () => {
+    const current = built
+    built = undefined
+    if (!current) return
+    try {
+      current.wrapper.destroyRecursively()
+      const parent = current.wrapper.parent
+      if (parent) parent.remove(current.wrapper)
+    } catch {
+      // Best effort — the dialog is closing anyway.
+    }
+    releaseSyntaxStyle(current.style)
+  }
+
+  onMount(() => {
+    if (!host || built) return
+    const style = buildSyntaxStyle(props.theme)
+    const code = new CodeRenderable(context.renderer, {
+      content: props.content(),
+      filetype: props.filetype(),
+      syntaxStyle: style,
+      fg: props.theme.text.base,
+      wrapMode: "none",
+      conceal: false,
+    })
+    const wrapper = new LineNumberRenderable(context.renderer, {
+      target: code,
+      fg: props.theme.text.muted,
+      minWidth: 3,
+      paddingRight: 1,
+    })
+    host.add(wrapper)
+    built = { wrapper, code, style }
+  })
+
+  createEffect(() => {
+    const content = props.content()
+    const filetype = props.filetype()
+    const searchQuery = props.searchQuery().trim()
+    const code = built?.code
+    if (!code || code.isDestroyed) return
+    code.onHighlight = (highlights, highlightContext) => {
+      if (!searchQuery) return highlights
+      const matches = findSearchMatches(highlightContext.content, searchQuery)
+      return [
+        ...highlights,
+        ...matches.map(([start, end]) => [start, end, "search"] as [number, number, string]),
+      ]
+    }
+    if (code.content !== content) code.content = content
+    if (code.filetype !== filetype) code.filetype = filetype
+  })
+
+  createEffect(() => {
+    const match = props.activeMatch()
+    const current = built
+    if (!current) return
+    current.wrapper.clearAllLineColors()
+    if (!match) return
+    const position = searchPosition(props.content(), match[0])
+    current.wrapper.setLineColor(position.line, { gutter: props.theme.background.raised.max })
+
+    // Scroll after layout so a newly mounted pane has its full scroll range.
+    const jump = () => {
+      const scroll = props.scroll()
+      if (!scroll || scroll.isDestroyed || current.code.isDestroyed) return
+      const lib = resolveRenderLib()
+      const encoded = lib.encodeUnicode(position.prefix, context.renderer.widthMethod)
+      let column = 0
+      if (encoded) {
+        try {
+          for (const cell of encoded.data) column += cell.char === 9 ? 4 : cell.width
+        } finally {
+          lib.freeUnicode(encoded)
+        }
+      }
+      const gutter = Math.max(3, String(countLines(props.content())).length) + 1
+      scroll.scrollTo({
+        x: Math.max(0, column + gutter - Math.floor(scroll.viewport.width / 2)),
+        y: Math.max(0, position.line - Math.floor(scroll.viewport.height / 2)),
+      })
+    }
+    context.renderer.once(CliRenderEvents.FRAME, jump)
+    context.renderer.requestRender()
+    onCleanup(() => context.renderer.off(CliRenderEvents.FRAME, jump))
+  })
+
+  onCleanup(teardown)
+
+  return <box ref={host} />
+}
+
+/** Side-by-side diff rendered with the same colors as OpenCode's diff viewer. */
+function DiffPane(props: {
+  theme: PreviewTheme
+  change: () => FileChange
+  filetype: () => string | undefined
+}) {
+  const theme = props.theme
+  const syntaxStyle = buildSyntaxStyle(theme)
+  onCleanup(() => releaseSyntaxStyle(syntaxStyle))
   return (
-    <box flexDirection="column" width="100%" height="100%" padding={1}>
-      <Show when={current()}>
-        {(preview) => (
-          <>
-            <text fg="cyan">{preview().node.path}</text>
-            <Show when={preview().branch}>
-              <text fg="yellow">Git branch: {preview().branch}</text>
-            </Show>
-            <scrollbox flexGrow={1} stickyScroll={false}>
-              <text wrapMode="none" fg="white">
-                {preview().content}
-              </text>
-              <Show when={preview().diff}>
-                {(diff) => (
-                  <>
-                    <text fg="yellow">
-                      {`\nGit changes: ${diff().status} (+${diff().additions} -${diff().deletions})\n`}
-                    </text>
-                    <text wrapMode="none" fg="white">
-                      {diff().patch}
-                    </text>
-                  </>
-                )}
-              </Show>
-            </scrollbox>
-            <text fg="gray">Esc to close</text>
-          </>
-        )}
-      </Show>
+    <diff
+      diff={props.change().patch}
+      view="split"
+      syncScroll={true}
+      filetype={props.filetype()}
+      syntaxStyle={syntaxStyle}
+      showLineNumbers={true}
+      wrapMode="char"
+      fg={theme.text.base}
+      addedBg={theme.diff.background.added}
+      removedBg={theme.diff.background.removed}
+      contextBg={theme.diff.background.context}
+      addedSignColor={theme.diff.highlight.added}
+      removedSignColor={theme.diff.highlight.removed}
+      lineNumberFg={theme.diff.lineNumber.text}
+      lineNumberBg={theme.diff.background.context}
+      addedLineNumberBg={theme.diff.lineNumber.background.added}
+      removedLineNumberBg={theme.diff.lineNumber.background.removed}
+    />
+  )
+}
+
+function MessagePane(props: { theme: PreviewTheme; label: () => string }) {
+  return (
+    <box flexDirection="column" flexGrow={1} minHeight={0} justifyContent="center" alignItems="center" rowGap={1}>
+      <text fg={props.theme.text.action.primary.base} attributes={TextAttributes.BOLD}>
+        ◇
+      </text>
+      <text fg={props.theme.text.muted}>{props.label()}</text>
     </box>
   )
 }
 
+/**
+ * VSCode-style file preview: tab bar with git status, highlighted editor with
+ * line numbers, side-by-side working-tree diff, and a status bar. The dialog frame
+ * sizes itself from its content, so the root box owns an explicit height.
+ */
+function FilePreviewDialog(props: { preview: () => FilePreview | undefined }) {
+  const context = usePlugin()
+  const theme = context.theme.surface("dialog") as PreviewTheme
+  const dimensions = useTerminalDimensions()
+
+  // Apply presentation to the mounted dialog, after show() initializes it.
+  onMount(() => context.ui.dialog.set({ size: "xlarge", centered: true }))
+
+  const current = props.preview
+
+  const readyPreview = createMemo(() => {
+    const preview = current()
+    return preview && preview.status === "ready" ? preview : undefined
+  })
+
+  const [searchOpen, setSearchOpen] = createSignal(false)
+  const [searchQuery, setSearchQuery] = createSignal("")
+  const [matchIndex, setMatchIndex] = createSignal(0)
+  const [showGitDiff, setShowGitDiff] = createSignal(false)
+  let dialogRoot: BoxRenderable | undefined
+  let searchInput: InputRenderable | undefined
+  let codeScroll: ScrollBoxRenderable | undefined
+  let diffScroll: ScrollBoxRenderable | undefined
+
+  createEffect(() => {
+    if (!showGitDiff()) return
+    const width = dimensions().width
+    const frame = dialogRoot?.parent
+    if (!isRenderable(frame) || frame.isDestroyed) return
+
+    // The host's largest preset is capped at 116 columns and its dialog API
+    // has no custom width. Expand the containing frame, not just its child,
+    // so centering and mouse hit areas follow the wider split view too.
+    frame.minWidth = Math.max(1, width - 4)
+    onCleanup(() => {
+      if (!frame.isDestroyed) frame.minWidth = undefined
+    })
+  })
+
+  const focusSearch = () => {
+    setShowGitDiff(false)
+    setSearchOpen(true)
+    if (searchInput && !searchInput.isDestroyed) searchInput.focus()
+  }
+
+  const closeSearch = () => {
+    searchInput?.blur()
+    setSearchOpen(false)
+    if (showGitDiff()) diffScroll?.focus()
+    else codeScroll?.focus()
+  }
+
+  const toggleGitDiff = () => {
+    searchInput?.blur()
+    setSearchOpen(false)
+    setShowGitDiff((value) => !value)
+  }
+
+  const searchMatches = createMemo(() => findSearchMatches(readyPreview()?.content ?? "", searchQuery()))
+  const activeMatch = createMemo(() => searchMatches()[matchIndex()])
+  const moveMatch = (direction: number) => {
+    const count = searchMatches().length
+    if (count) setMatchIndex((index) => (index + direction + count) % count)
+  }
+
+  // Dialog-owned keymap takes precedence over session.first (also Ctrl+G).
+  context.keymap.layer(() => ({
+    mode: "global",
+    priority: 100,
+    commands: [
+      { bind: "ctrl+f", run: focusSearch },
+      { bind: "ctrl+g", run: toggleGitDiff },
+      { bind: "return", enabled: searchOpen, run: () => moveMatch(1) },
+      { bind: "shift+return", enabled: searchOpen, run: () => moveMatch(-1) },
+      { bind: "escape", enabled: searchOpen, run: closeSearch },
+    ],
+  }))
+
+  // Let the host center the dialog; reserve most of the terminal for the file
+  // while keeping a small outer margin, including on short terminals.
+  const contentHeight = createMemo(() => {
+    const height = dimensions().height
+    return Math.max(1, Math.min(height - 4, Math.max(14, Math.floor(height * 0.85))))
+  })
+  const filetype = createMemo(() => pathToFiletype(current()?.node.path ?? ""))
+  const linesLabel = createMemo(() => {
+    const preview = readyPreview()
+    return preview ? `${countLines(preview.content)} lines` : ""
+  })
+  const eolLabel = createMemo(() => {
+    const preview = readyPreview()
+    return preview ? detectEol(preview.content) : ""
+  })
+  const breadcrumb = createMemo(() => {
+    const relative = current()?.relativePath ?? ""
+    const index = relative.lastIndexOf("/")
+    return index === -1 ? "" : relative.slice(0, index)
+  })
+  const comparisonLabel = createMemo(() => {
+    const branch = current()?.branch
+    return `working tree${branch ? ` · ${branch}` : ""}`
+  })
+
+  const statusLabel = () => {
+    if (readyPreview()?.gitMessage) return "git unavailable"
+    const change = readyPreview()?.change
+    if (!change) return "clean"
+    if (change.status === "added") return "added"
+    if (change.status === "deleted") return "deleted"
+    return "modified"
+  }
+
+  const statusColor = () => {
+    const change = readyPreview()?.change
+    if (!change) return theme.text.muted
+    if (change.status === "added") return theme.diff.text.added
+    if (change.status === "deleted") return theme.diff.text.removed
+    return theme.text.feedback.warning.base
+  }
+  const statusGlyph = () => {
+    const change = readyPreview()?.change
+    if (!change) return "·"
+    return change.status === "added" ? "A" : change.status === "deleted" ? "D" : "M"
+  }
+
+  const messageLabel = () => {
+    const preview = current()
+    switch (preview?.status) {
+      case "loading":
+        return "Loading file..."
+      case "binary":
+        return "Binary file — preview unavailable"
+      case "too-large":
+        return `File too large to preview (${formatBytes(preview.sizeBytes)})`
+      case "error":
+        return preview.message ?? "Unable to open file"
+      default:
+        return ""
+    }
+  }
+
+  return (
+    <box
+      ref={dialogRoot}
+      flexDirection="column"
+      width="100%"
+      height={contentHeight()}
+      backgroundColor={theme.background.base}
+      border={true}
+      borderStyle="rounded"
+      borderColor={theme.background.raised.high}
+    >
+      <box
+        flexDirection="row"
+        height={1}
+        flexShrink={0}
+        paddingLeft={1}
+        paddingRight={1}
+        columnGap={1}
+        backgroundColor={theme.background.raised.max}
+      >
+        <text fg={theme.text.action.primary.base} flexShrink={0}>
+          ●
+        </text>
+        <text fg={theme.text.base} attributes={TextAttributes.BOLD} flexShrink={0}>
+          {current()?.node.name ?? ""}
+        </text>
+        <Show when={readyPreview()}>
+          <box flexDirection="row" paddingLeft={1} paddingRight={1} backgroundColor={theme.background.raised.high}>
+            <text fg={statusColor()} attributes={TextAttributes.BOLD}>
+              {statusGlyph()} {statusLabel()}
+            </text>
+          </box>
+        </Show>
+        <box flexGrow={1} minWidth={0} />
+        <box
+          paddingLeft={1}
+          paddingRight={1}
+          flexShrink={0}
+          backgroundColor={showGitDiff() ? theme.text.action.primary.base : theme.background.raised.high}
+          onMouseUp={(event) => {
+            if (event.button !== 0) return
+            event.stopPropagation()
+            toggleGitDiff()
+          }}
+        >
+          <text fg={showGitDiff() ? theme.background.base : theme.text.base}>
+            {showGitDiff() ? "[x] Git diff" : "[ ] Git diff"}
+          </text>
+        </box>
+        <text fg={theme.text.muted} flexShrink={0}>
+          File preview
+        </text>
+      </box>
+
+      <box
+        flexDirection="row"
+        height={1}
+        flexShrink={0}
+        paddingLeft={2}
+        paddingRight={1}
+        columnGap={1}
+        backgroundColor={theme.background.raised.base}
+      >
+        <text fg={theme.text.muted} truncate flexGrow={1} minWidth={0}>
+          {current()?.relativePath ?? breadcrumb()}
+        </text>
+        <Show when={linesLabel()}>
+          <text fg={theme.text.muted} flexShrink={0}>
+            {linesLabel()}
+          </text>
+        </Show>
+      </box>
+
+      <Show when={searchOpen()}>
+        <box
+          flexDirection="row"
+          height={1}
+          flexShrink={0}
+          paddingLeft={1}
+          paddingRight={1}
+          columnGap={1}
+          backgroundColor={theme.background.raised.base}
+        >
+          <text fg={theme.text.action.primary.base} flexShrink={0}>
+            /
+          </text>
+          <input
+            ref={searchInput}
+            value={searchQuery()}
+            placeholder="Search in file..."
+            placeholderColor={theme.text.muted}
+            backgroundColor={theme.background.raised.high}
+            focusedBackgroundColor={theme.background.raised.high}
+            textColor={theme.text.base}
+            focusedTextColor={theme.text.base}
+            flexGrow={1}
+            minWidth={0}
+            onInput={(value) => {
+              setMatchIndex(0)
+              setSearchQuery(value)
+            }}
+            focused
+          />
+          <text fg={theme.text.muted} flexShrink={0}>
+            {searchQuery().trim() ? `${searchMatches().length ? matchIndex() + 1 : 0}/${searchMatches().length}` : "type to search"}
+          </text>
+          <text fg={theme.text.muted} flexShrink={0}>
+            Enter next · Shift+Enter prev · Esc
+          </text>
+        </box>
+      </Show>
+
+      <Show
+        when={showGitDiff()}
+        fallback={
+          <Show when={readyPreview()} keyed fallback={<MessagePane theme={theme} label={messageLabel} />}>
+            {(preview) => (
+              <scrollbox
+                ref={codeScroll}
+                flexGrow={1}
+                minHeight={0}
+                focused={!searchOpen()}
+                scrollX
+                paddingLeft={1}
+                paddingRight={1}
+              >
+                <CodePane
+                  theme={theme}
+                  content={() => preview.content}
+                  filetype={() => filetype()}
+                  searchQuery={searchQuery}
+                  activeMatch={activeMatch}
+                  scroll={() => codeScroll}
+                />
+              </scrollbox>
+            )}
+          </Show>
+        }
+      >
+        <Show
+          when={readyPreview()?.change}
+          fallback={
+            <MessagePane
+              theme={theme}
+              label={() => readyPreview()
+                ? readyPreview()?.gitMessage ?? "No uncommitted changes in this file"
+                : messageLabel()}
+            />
+          }
+        >
+          {(change) => (
+            <box flexDirection="column" flexGrow={1} minHeight={0} width="100%">
+              <box
+                flexDirection="row"
+                height={1}
+                flexShrink={0}
+                paddingLeft={1}
+                paddingRight={1}
+                columnGap={1}
+                backgroundColor={theme.background.raised.max}
+              >
+                <text fg={theme.text.action.primary.base} attributes={TextAttributes.BOLD} flexShrink={0}>
+                  Git diff
+                </text>
+                <text fg={theme.diff.text.added} flexShrink={0}>
+                  +{change().additions}
+                </text>
+                <text fg={theme.diff.text.removed} flexShrink={0}>
+                  -{change().deletions}
+                </text>
+                <text fg={theme.text.muted} truncate flexGrow={1} minWidth={0}>
+                  {comparisonLabel()}
+                </text>
+              </box>
+              <box
+                flexDirection="row"
+                height={1}
+                flexShrink={0}
+                paddingLeft={1}
+                paddingRight={1}
+                backgroundColor={theme.background.raised.base}
+              >
+                <box width="50%" paddingLeft={1}>
+                  <text fg={theme.diff.text.removed} truncate>HEAD · before</text>
+                </box>
+                <box width="50%" paddingLeft={1}>
+                  <text fg={theme.diff.text.added} truncate>Working tree · after</text>
+                </box>
+              </box>
+              <scrollbox
+                ref={diffScroll}
+                flexGrow={1}
+                minHeight={0}
+                focused
+                paddingLeft={1}
+                paddingRight={1}
+              >
+                <DiffPane theme={theme} change={() => change()} filetype={() => filetype()} />
+              </scrollbox>
+            </box>
+          )}
+        </Show>
+      </Show>
+
+      <box
+        flexDirection="row"
+        height={1}
+        flexShrink={0}
+        paddingLeft={1}
+        paddingRight={1}
+        columnGap={1}
+        backgroundColor={theme.background.raised.max}
+      >
+        <box flexDirection="row" paddingLeft={1} paddingRight={1} backgroundColor={theme.background.raised.high}>
+          <text fg={theme.text.base} attributes={TextAttributes.BOLD}>
+            Esc
+          </text>
+          <text fg={theme.text.muted}> close</text>
+        </box>
+        <Show when={current()?.branch}>
+          {(branch) => (
+            <text fg={theme.text.muted} flexShrink={0}>
+              git: {branch()}
+            </text>
+          )}
+        </Show>
+        <text fg={theme.text.muted} flexShrink={0}>
+          Ctrl+F search
+        </text>
+        <text fg={theme.text.muted} flexShrink={0}>
+          Ctrl+G {showGitDiff() ? "file" : "git diff"}
+        </text>
+        <box flexGrow={1} minWidth={0} />
+        <Show when={readyPreview()}>
+          <text fg={theme.text.muted} flexShrink={0}>
+            {eolLabel()}
+          </text>
+          <text fg={theme.text.muted} flexShrink={0}>
+            UTF-8
+          </text>
+          <text fg={theme.text.muted} flexShrink={0}>
+            {formatBytes(current()?.sizeBytes ?? 0)}
+          </text>
+          <text fg={theme.text.muted} flexShrink={0}>
+            {linesLabel()}
+          </text>
+        </Show>
+        <text fg={theme.text.muted} flexShrink={0}>
+          {languageName(filetype())}
+        </text>
+      </box>
+    </box>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// File tree panel
+// ---------------------------------------------------------------------------
+
 function FileTreePanel() {
   const context = usePlugin()
+  // Reactive accessor — the sidebar lives for the whole session and must
+  // follow theme switches; `context.theme` is a reactive getter on the host.
+  const theme = () => context.theme as PreviewTheme
   const location = context.location ?? context.data.location.default()
   const root = path.resolve(location?.directory ?? process.cwd())
+  const dimensions = useTerminalDimensions()
 
   const [rootEntries, setRootEntries] = createSignal<FileNode[]>([])
   const [revision, setRevision] = createSignal(0)
@@ -132,6 +1028,8 @@ function FileTreePanel() {
   const loaded = new Map<string, FileNode[]>()
   const expanded = new Set<string>()
   let lastClick: { path: string; time: number } = { path: "", time: 0 }
+  let pendingOpen: FileNode | undefined
+  let openToken = 0
 
   const loadDirectory = async (directory: string, depth: number): Promise<FileNode[]> => {
     const cached = loaded.get(directory)
@@ -175,11 +1073,20 @@ function FileTreePanel() {
     return result
   })
 
+  // Rows the sidebar viewport can actually show: terminal height minus the
+  // chrome rows, clamped so tiny terminals still show a few entries and huge
+  // terminals never exceed the hard ceiling.
+  const visibleRows = createMemo(() => {
+    const available = dimensions().height - RESERVED_ROWS
+    return Math.max(MIN_ROWS, Math.min(MAX_ROWS, available))
+  })
+
   const displayed = createMemo(() => {
     const rows = visible()
     const index = selected()
-    const start = Math.max(0, Math.min(index - Math.floor(MAX_ROWS / 2), rows.length - MAX_ROWS))
-    return rows.slice(start, start + MAX_ROWS).map((node, offset) => ({
+    const count = visibleRows()
+    const start = Math.max(0, Math.min(index - Math.floor(count / 2), rows.length - count))
+    return rows.slice(start, start + count).map((node, offset) => ({
       node,
       index: start + offset,
     }))
@@ -249,46 +1156,85 @@ function FileTreePanel() {
       ])
       const relativePath = normalizeGitPath(path.relative(root, filePath))
       const comparisonPath = process.platform === "win32" ? relativePath.toLowerCase() : relativePath
-      const fileDiff = changes.data.find((change) => {
+      const fileChange = changes.data.find((change) => {
         const changePath = normalizeGitPath(change.file)
         const normalizedChangePath = process.platform === "win32" ? changePath.toLowerCase() : changePath
         return normalizedChangePath === comparisonPath || normalizedChangePath.endsWith(`/${comparisonPath}`)
       })
 
-      return {
-        branch: vcs.data.branch.current ?? vcs.data.branch.default,
-        diff: fileDiff,
+      if (fileChange) {
+        return {
+          branch: vcs.data.branch.current ?? vcs.data.branch.default,
+          change: fileChange as FileChange,
+          gitMessage: undefined,
+        }
       }
     } catch {
-      return undefined
+      // The service may not have detected this local repository yet.
+    }
+
+    try {
+      return { ...await loadLocalGitInfo(filePath), gitMessage: undefined }
+    } catch (cause) {
+      return {
+        branch: undefined,
+        change: undefined,
+        gitMessage: `Unable to read Git changes: ${cause instanceof Error ? cause.message : String(cause)}`,
+      }
     }
   }
 
   const openFile = async (node: FileNode) => {
     if (node.directory) return
-    setPreview({ node, content: "Loading file..." })
-    context.ui.dialog.set({ size: "xlarge", centered: true })
+    const token = ++openToken
+    const stale = () => token !== openToken
+    const relativePath = normalizeGitPath(path.relative(root, node.path))
+
+    ensureRemoteParsers()
+    setPreview({ node, status: "loading", content: "", sizeBytes: 0, relativePath })
     context.ui.dialog.show(
       () => <FilePreviewDialog preview={preview} />,
-      () => setPreview(undefined),
+      () => {
+        if (!stale()) setPreview(undefined)
+      },
     )
 
     try {
-      const fileStats = await stat(node.path)
+      const [fileStats, git] = await Promise.all([stat(node.path), loadGitInfo(node.path)])
+      if (stale()) return
+
       if (fileStats.size > MAX_FILE_SIZE) {
-        setPreview({
-          node,
-          content: `This file is too large to preview (${Math.ceil(fileStats.size / 1024)} KB).`,
-        })
+        setPreview({ node, status: "too-large", content: "", sizeBytes: fileStats.size, relativePath })
         return
       }
 
-      const [content, git] = await Promise.all([readFile(node.path, "utf8"), loadGitInfo(node.path)])
-      setPreview({ node, content, branch: git?.branch, diff: git?.diff })
-    } catch (cause) {
+      const content = await readFile(node.path, "utf8")
+      if (stale()) return
+
+      if (isBinaryContent(content)) {
+        setPreview({ node, status: "binary", content: "", sizeBytes: fileStats.size, relativePath })
+        return
+      }
+
       setPreview({
         node,
-        content: `Unable to open file: ${cause instanceof Error ? cause.message : String(cause)}`,
+        status: "ready",
+        content,
+        sizeBytes: fileStats.size,
+        relativePath,
+        branch: git?.branch,
+        change: git?.change,
+        gitMessage: git?.gitMessage,
+      })
+    } catch (cause) {
+      if (stale()) return
+      setPreview({
+        node,
+        status: "error",
+        content: "",
+        sizeBytes: 0,
+        relativePath,
+        message: cause instanceof Error ? cause.message : String(cause),
       })
     }
   }
@@ -304,6 +1250,7 @@ function FileTreePanel() {
     }
 
     if (event.button !== 0) return
+    pendingOpen = undefined
     if (node.directory) {
       void toggleDirectory(node)
       return
@@ -312,19 +1259,25 @@ function FileTreePanel() {
     const now = Date.now()
     const isDoubleClick = lastClick.path === node.path && now - lastClick.time <= DOUBLE_CLICK_DELAY
     lastClick = { path: node.path, time: now }
-    if (isDoubleClick) void openFile(node)
+    if (isDoubleClick) pendingOpen = node
+  }
+
+  const handleNodeMouseUp = (event: TuiMouseEvent, item: { node: FileNode; index: number }) => {
+    if (event.button !== 0 || pendingOpen?.path !== item.node.path) return
+    pendingOpen = undefined
+    void openFile(item.node)
   }
 
   onMount(() => void refresh())
 
   return (
-    <box flexDirection="column" padding={1}>
-      <text fg={context.theme.text.muted}>Files</text>
-      <text fg={context.theme.text.base} truncate>
+    <box flexDirection="column">
+      <text fg={theme().text.muted}>Files</text>
+      <text fg={theme().text.base} truncate>
         {root}
       </text>
-      <Show when={!loading()} fallback={<text fg={context.theme.text.muted}>Loading...</text>}>
-        <Show when={!error()} fallback={<text fg={context.theme.error}>{error()}</text>}>
+      <Show when={!loading()} fallback={<text fg={theme().text.muted}>Loading...</text>}>
+        <Show when={!error()} fallback={<text fg={theme().text.feedback.error.base} truncate>{error()}</text>}>
           <For each={displayed()}>
             {(item) => {
               const active = () => item.index === selected()
@@ -333,8 +1286,9 @@ function FileTreePanel() {
                 <box
                   flexDirection="row"
                   onMouseDown={(event) => handleNodeMouseDown(event, item)}
+                  onMouseUp={(event) => handleNodeMouseUp(event, item)}
                 >
-                  <text fg={active() ? context.theme.accent : context.theme.text.base}>
+                  <text fg={active() ? theme().text.action.primary.base : theme().text.base} truncate>
                     {active() ? "› " : "  "}
                     {"  ".repeat(item.node.indent)}
                     {marker()}
@@ -346,7 +1300,9 @@ function FileTreePanel() {
           </For>
         </Show>
       </Show>
-      <text fg={context.theme.text.muted}>Double-click file to view · Right-click to copy path</text>
+      <text fg={theme().text.muted} truncate>
+        Double-click view · right-click copy
+      </text>
     </box>
   )
 }
