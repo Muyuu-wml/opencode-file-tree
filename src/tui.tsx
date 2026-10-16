@@ -1,13 +1,16 @@
 import { spawn } from "node:child_process"
-import { readdir } from "node:fs/promises"
+import { readdir, readFile, stat } from "node:fs/promises"
 import path from "node:path"
 import { createMemo, createSignal, For, onMount, Show } from "solid-js"
+import type { MouseEvent as TuiMouseEvent } from "@opentui/core"
 import { Plugin, usePlugin } from "@opencode/plugin/tui"
 
 const IGNORED_DIRECTORIES = new Set([".git", "node_modules", ".next", "dist", "build", "coverage", "target"])
 const MAX_DEPTH = 8
 const MAX_ENTRIES = 5000
 const MAX_ROWS = 45
+const MAX_FILE_SIZE = 1024 * 1024
+const DOUBLE_CLICK_DELAY = 350
 
 type FileNode = {
   name: string
@@ -18,6 +21,18 @@ type FileNode = {
 
 type VisibleNode = FileNode & {
   indent: number
+}
+
+type FilePreview = {
+  node: FileNode
+  content: string
+  branch?: string
+  diff?: {
+    status: "added" | "deleted" | "modified"
+    additions: number
+    deletions: number
+    patch: string
+  }
 }
 
 async function runClipboardCommand(command: string, args: string[], value: string): Promise<void> {
@@ -62,6 +77,47 @@ async function copyToClipboard(value: string): Promise<void> {
   throw lastError instanceof Error ? lastError : new Error("No clipboard command is available")
 }
 
+function normalizeGitPath(value: string): string {
+  return value.replaceAll("\\", "/").replace(/^\.\//, "")
+}
+
+function FilePreviewDialog(props: { preview: () => FilePreview | undefined }) {
+  const current = () => props.preview()
+
+  return (
+    <box flexDirection="column" width="100%" height="100%" padding={1}>
+      <Show when={current()}>
+        {(preview) => (
+          <>
+            <text fg="cyan">{preview().node.path}</text>
+            <Show when={preview().branch}>
+              <text fg="yellow">Git branch: {preview().branch}</text>
+            </Show>
+            <scrollbox flexGrow={1} stickyScroll={false}>
+              <text wrapMode="none" fg="white">
+                {preview().content}
+              </text>
+              <Show when={preview().diff}>
+                {(diff) => (
+                  <>
+                    <text fg="yellow">
+                      {`\nGit changes: ${diff().status} (+${diff().additions} -${diff().deletions})\n`}
+                    </text>
+                    <text wrapMode="none" fg="white">
+                      {diff().patch}
+                    </text>
+                  </>
+                )}
+              </Show>
+            </scrollbox>
+            <text fg="gray">Esc to close</text>
+          </>
+        )}
+      </Show>
+    </box>
+  )
+}
+
 function FileTreePanel() {
   const context = usePlugin()
   const location = context.location ?? context.data.location.default()
@@ -72,8 +128,10 @@ function FileTreePanel() {
   const [selected, setSelected] = createSignal(0)
   const [loading, setLoading] = createSignal(true)
   const [error, setError] = createSignal<string>()
+  const [preview, setPreview] = createSignal<FilePreview>()
   const loaded = new Map<string, FileNode[]>()
   const expanded = new Set<string>()
+  let lastClick: { path: string; time: number } = { path: "", time: 0 }
 
   const loadDirectory = async (directory: string, depth: number): Promise<FileNode[]> => {
     const cached = loaded.get(directory)
@@ -162,13 +220,14 @@ function FileTreePanel() {
     setRevision((value) => value + 1)
   }
 
-  const copySelected = async (node = visible()[selected()]) => {
-    if (!node) return
+  const copySelected = async (node?: FileNode) => {
+    const target = node ?? visible()[selected()]
+    if (!target) return
     try {
-      await copyToClipboard(node.path)
+      await copyToClipboard(target.path)
       context.ui.toast.show({
         title: "Path copied",
-        message: node.path,
+        message: target.path,
         variant: "success",
         duration: 2500,
       })
@@ -179,6 +238,81 @@ function FileTreePanel() {
         variant: "error",
       })
     }
+  }
+
+  const loadGitInfo = async (filePath: string) => {
+    try {
+      const location = { directory: root }
+      const [vcs, changes] = await Promise.all([
+        context.client.vcs.get({ location }),
+        context.client.vcs.diff({ location, mode: "working", context: 3 }),
+      ])
+      const relativePath = normalizeGitPath(path.relative(root, filePath))
+      const comparisonPath = process.platform === "win32" ? relativePath.toLowerCase() : relativePath
+      const fileDiff = changes.data.find((change) => {
+        const changePath = normalizeGitPath(change.file)
+        const normalizedChangePath = process.platform === "win32" ? changePath.toLowerCase() : changePath
+        return normalizedChangePath === comparisonPath || normalizedChangePath.endsWith(`/${comparisonPath}`)
+      })
+
+      return {
+        branch: vcs.data.branch.current ?? vcs.data.branch.default,
+        diff: fileDiff,
+      }
+    } catch {
+      return undefined
+    }
+  }
+
+  const openFile = async (node: FileNode) => {
+    if (node.directory) return
+    setPreview({ node, content: "Loading file..." })
+    context.ui.dialog.set({ size: "xlarge", centered: true })
+    context.ui.dialog.show(
+      () => <FilePreviewDialog preview={preview} />,
+      () => setPreview(undefined),
+    )
+
+    try {
+      const fileStats = await stat(node.path)
+      if (fileStats.size > MAX_FILE_SIZE) {
+        setPreview({
+          node,
+          content: `This file is too large to preview (${Math.ceil(fileStats.size / 1024)} KB).`,
+        })
+        return
+      }
+
+      const [content, git] = await Promise.all([readFile(node.path, "utf8"), loadGitInfo(node.path)])
+      setPreview({ node, content, branch: git?.branch, diff: git?.diff })
+    } catch (cause) {
+      setPreview({
+        node,
+        content: `Unable to open file: ${cause instanceof Error ? cause.message : String(cause)}`,
+      })
+    }
+  }
+
+  const handleNodeMouseDown = (event: TuiMouseEvent, item: { node: FileNode; index: number }) => {
+    const node = item.node
+    setSelected(item.index)
+
+    if (event.button === 2) {
+      if (!node.directory) void copySelected(node)
+      event.preventDefault()
+      return
+    }
+
+    if (event.button !== 0) return
+    if (node.directory) {
+      void toggleDirectory(node)
+      return
+    }
+
+    const now = Date.now()
+    const isDoubleClick = lastClick.path === node.path && now - lastClick.time <= DOUBLE_CLICK_DELAY
+    lastClick = { path: node.path, time: now }
+    if (isDoubleClick) void openFile(node)
   }
 
   onMount(() => void refresh())
@@ -198,11 +332,7 @@ function FileTreePanel() {
               return (
                 <box
                   flexDirection="row"
-                  onMouseDown={() => {
-                    setSelected(item.index)
-                    if (item.node.directory) void toggleDirectory(item.node)
-                    else void copySelected(item.node)
-                  }}
+                  onMouseDown={(event) => handleNodeMouseDown(event, item)}
                 >
                   <text fg={active() ? context.theme.accent : context.theme.text.base}>
                     {active() ? "› " : "  "}
@@ -216,7 +346,7 @@ function FileTreePanel() {
           </For>
         </Show>
       </Show>
-      <text fg={context.theme.text.muted}>Click file to copy path</text>
+      <text fg={context.theme.text.muted}>Double-click file to view · Right-click to copy path</text>
     </box>
   )
 }
