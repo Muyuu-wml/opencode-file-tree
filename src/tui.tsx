@@ -34,7 +34,7 @@ const MAX_ENTRIES = 5000
 const MAX_ROWS = 45
 const MIN_ROWS = 4
 // Rows outside the tree itself: the host sidebar's outer padding, session
-// title, and footer slot (~5), plus this panel's "Files" label, root path,
+// title, and footer slot (~5), plus this panel's Files/Refresh header, root path,
 // hint line, and one blank row of breathing room (~4). The tree never grows
 // past these, so it cannot run flush against the bottom of the sidebar.
 const RESERVED_ROWS = 9
@@ -1027,11 +1027,13 @@ function FileTreePanel() {
   const [preview, setPreview] = createSignal<FilePreview>()
   const loaded = new Map<string, FileNode[]>()
   const expanded = new Set<string>()
+  let treeVersion = 0
   let lastClick: { path: string; time: number } = { path: "", time: 0 }
   let pendingOpen: FileNode | undefined
   let openToken = 0
 
   const loadDirectory = async (directory: string, depth: number): Promise<FileNode[]> => {
+    const version = treeVersion
     const cached = loaded.get(directory)
     if (cached) return cached
 
@@ -1051,7 +1053,7 @@ function FileTreePanel() {
         return left.name.localeCompare(right.name, undefined, { numeric: true, sensitivity: "base" })
       })
 
-    loaded.set(directory, nodes)
+    if (version === treeVersion) loaded.set(directory, nodes)
     return nodes
   }
 
@@ -1093,6 +1095,9 @@ function FileTreePanel() {
   })
 
   const refresh = async () => {
+    treeVersion++
+    pendingOpen = undefined
+    lastClick = { path: "", time: 0 }
     setLoading(true)
     setError(undefined)
     loaded.clear()
@@ -1110,13 +1115,16 @@ function FileTreePanel() {
 
   const toggleDirectory = async (node: FileNode) => {
     if (!node.directory) return
+    const version = treeVersion
     if (expanded.has(node.path)) {
       expanded.delete(node.path)
     } else {
       try {
         await loadDirectory(node.path, node.depth + 1)
+        if (version !== treeVersion) return
         expanded.add(node.path)
       } catch (cause) {
+        if (version !== treeVersion) return
         context.ui.toast.show({
           title: "File tree",
           message: cause instanceof Error ? cause.message : String(cause),
@@ -1272,7 +1280,25 @@ function FileTreePanel() {
 
   return (
     <box flexDirection="column">
-      <text fg={theme().text.muted}>Files</text>
+      <box flexDirection="row" height={1} flexShrink={0}>
+        <text fg={theme().text.muted} flexShrink={0}>Files</text>
+        <box flexGrow={1} minWidth={0} />
+        <box
+          flexShrink={0}
+          paddingLeft={1}
+          paddingRight={1}
+          backgroundColor={theme().background.raised.high}
+          onMouseUp={(event) => {
+            if (event.button !== 0) return
+            event.stopPropagation()
+            if (!loading()) void refresh()
+          }}
+        >
+          <text fg={loading() ? theme().text.muted : theme().text.action.primary.base}>
+            {loading() ? "Refreshing..." : "Refresh"}
+          </text>
+        </box>
+      </box>
       <text fg={theme().text.base} truncate>
         {root}
       </text>
