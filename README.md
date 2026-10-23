@@ -125,14 +125,15 @@ opencode plugin add opencodev2-file-tree
 ## 开发
 
 ```bash
-npm install
+npm install      # 自动执行 npm run build
+npm run build    # 重新编译 dist/
 npm run typecheck
 npm pack --dry-run
 ```
 
-发布前确认打包内容包含 `src/`、`tsconfig.json`、`README.md`、`LICENSE` 和 `package.json`。`tsconfig.json` 必须随包发布：它声明了 `jsxImportSource: "@opentui/solid"`，缺少时宿主会用默认的 React JSX 运行时，加载时报 `Cannot find package 'react'`。`src/tui.tsx` 顶部的 `@jsxImportSource` 注释是同样的保险。
+TUI 入口源码是 `src/tui.tsx`，但 npm 包导出的是编译后的 `dist/tui.js`。原因是 OpenCode 宿主只对 `node_modules` 之外的 `.tsx` 应用 OpenTUI 的 Solid JSX 转换；直接发布 `.tsx` 会在安装后落到 Bun 默认的 React JSX 运行时，报 `Cannot find package 'react'`。`tsconfig.json` 的 `jsxImportSource` 和文件头部注释只影响类型检查，不能替代编译。
 
-开发时也可以在 `opencode.json` 的 `plugins` 中直接写插件目录，用源码加载，修改后重启 OpenCode 生效。
+修改 `src/` 后需要 `npm run build` 再重启 OpenCode。开发时也可以在 `opencode.json` 的 `plugins` 中直接写插件目录，但同样读取 `dist/tui.js`。
 
 ### 项目结构
 
@@ -142,6 +143,11 @@ src/
   tui.tsx            文件树、预览弹窗与交互
   preview-search.ts  搜索匹配与位置计算
   preview-git.ts     本地 Git 差异查询
+scripts/
+  build.mjs          Solid + TypeScript 预编译，输出到 dist/
+dist/                发布产物（npm run build 生成，不提交）
+index.ts             本地目录插件的服务端转发入口
+tui.ts               本地目录插件的 TUI 转发入口
 ```
 
 ### 版本与依赖
@@ -156,6 +162,8 @@ src/
 npm version patch
 npm publish
 ```
+
+`npm publish` 会通过 `prepare` 自动执行 `npm run build`，打包内容包含 `dist/`、`src/`、`tsconfig.json`、`README.md`、`LICENSE` 和 `package.json`。
 
 包名为 `opencodev2-file-tree`。npm 要求账号启用 2FA，发布时按提示完成浏览器 / Windows Hello 验证。
 

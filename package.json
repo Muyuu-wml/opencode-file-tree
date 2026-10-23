@@ -1,8 +1,9 @@
 {
   "name": "opencodev2-file-tree",
-  "version": "0.1.1",
+  "version": "0.1.3",
   "description": "OpenCode 2 TUI plugin: sidebar file tree, file preview, in-file search, git diff, and add selected code to chat.",
   "type": "module",
+  "main": "./src/index.ts",
   "license": "MIT",
   "author": "Muyuu-wml",
   "homepage": "https://github.com/Muyuu-wml/opencode-file-tree#readme",
@@ -23,14 +24,19 @@
   ],
   "exports": {
     ".": "./src/index.ts",
-    "./tui": "./src/tui.tsx"
+    "./tui": "./dist/tui.js"
   },
   "files": [
+    "dist",
+    "index.ts",
     "src",
+    "tui.ts",
     "tsconfig.json",
     "LICENSE"
   ],
   "scripts": {
+    "build": "node scripts/build.mjs",
+    "prepare": "npm run build",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
@@ -42,9 +48,12 @@
     "solid-js": ">=1.9.0"
   },
   "devDependencies": {
+    "@babel/core": "^7.29.7",
+    "@babel/preset-typescript": "^7.27.1",
     "@opentui/core": "0.6.6",
     "@opentui/solid": "0.6.6",
     "@types/node": "^22.0.0",
+    "babel-preset-solid": "^1.9.12",
     "solid-js": "^1.9.0",
     "typescript": "^5.7.0"
   }
