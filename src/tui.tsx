@@ -8,16 +8,18 @@ import {
   CliRenderEvents,
   CodeRenderable,
   isRenderable,
-  resolveRenderLib,
   LineNumberRenderable,
   pathToFiletype,
   SyntaxStyle,
   TextAttributes,
   type BoxRenderable,
+  type CliRenderer,
   type FiletypeParserOptions,
   type InputRenderable,
   type MouseEvent as TuiMouseEvent,
+  type NativeResourceOwner,
   type RGBA,
+  type Renderable,
   type ScrollBoxRenderable,
 } from "@opentui/core"
 import { Plugin, usePlugin } from "@opencode/plugin/tui"
@@ -47,6 +49,8 @@ const DOUBLE_CLICK_DELAY = 350
 const MAX_FILE_SIZE = 1024 * 1024
 const BINARY_SNIFF_LENGTH = 8000
 const STYLE_RELEASE_DELAY = 250
+const SELECTION_MENU_WIDTH = 30
+const SELECTION_MENU_HEIGHT = 4
 
 type FileNode = {
   name: string
@@ -252,7 +256,7 @@ interface PreviewTheme {
  * OpenCode itself uses (`generateSyntax` in @opencode/theme). This makes file
  * previews match the colors of OpenCode's own code blocks and diff viewer.
  */
-function buildSyntaxStyle(theme: PreviewTheme): SyntaxStyle {
+function buildSyntaxStyle(theme: PreviewTheme, owner: NativeResourceOwner): SyntaxStyle {
   const syntax = theme.syntax
   const markdown = theme.markdown
   const feedback = theme.text.feedback
@@ -350,7 +354,7 @@ function buildSyntaxStyle(theme: PreviewTheme): SyntaxStyle {
     error: { fg: feedback.error.base, bold: true },
     warning: { fg: feedback.warning.base, bold: true },
     info: { fg: feedback.info.base },
-  })
+  }, owner)
 }
 
 /** Releases a SyntaxStyle after its renderables are gone. */
@@ -362,6 +366,65 @@ function releaseSyntaxStyle(style: SyntaxStyle): void {
       // Renderer may already be gone.
     }
   }, STYLE_RELEASE_DELAY)
+}
+
+// ---------------------------------------------------------------------------
+// Chat composer
+// ---------------------------------------------------------------------------
+
+/** The host's chat input, structurally typed so any editor-like renderable fits. */
+type ComposerEditor = {
+  readonly isDestroyed: boolean
+  readonly y: number
+  readonly plainText?: string
+  insertText(text: string): void
+  gotoBufferEnd(options?: { select?: boolean }): unknown
+  focus(): void
+}
+
+function isComposerEditor(value: unknown): value is ComposerEditor {
+  if (!value || typeof value !== "object") return false
+  const editor = value as Partial<ComposerEditor>
+  return (
+    editor.isDestroyed !== true &&
+    typeof editor.insertText === "function" &&
+    typeof editor.gotoBufferEnd === "function"
+  )
+}
+
+// OpenCode 2.1 has no TUI plugin API for writing to the composer yet. The host
+// itself appends `tui.prompt.append` text with EditBufferRenderable.insertText,
+// so remember the editor that is focused when a preview opens and do the same.
+let composerEditor: ComposerEditor | undefined
+
+function captureComposer(renderer: CliRenderer): void {
+  const focused = renderer.currentFocusedEditor
+  if (isComposerEditor(focused)) {
+    composerEditor = focused
+    return
+  }
+
+  // Nothing focused: the composer is the bottom-most editor on screen.
+  let bottom: ComposerEditor | undefined
+  const visit = (node: Renderable): void => {
+    if (node.isDestroyed) return
+    if (isComposerEditor(node) && (!bottom || node.y >= bottom.y)) bottom = node
+    for (const child of node.getChildren()) visit(child)
+  }
+  visit(renderer.root)
+  if (bottom) composerEditor = bottom
+}
+
+function appendToComposer(renderer: CliRenderer, text: string): boolean {
+  const editor = composerEditor
+  if (!editor || editor.isDestroyed) return false
+  const existing = typeof editor.plainText === "string" ? editor.plainText : ""
+  const separator = existing.length > 0 && !existing.endsWith("\n") ? "\n" : ""
+  editor.gotoBufferEnd()
+  editor.insertText(`${separator}${text}`)
+  editor.focus()
+  renderer.requestRender()
+  return true
 }
 
 // ---------------------------------------------------------------------------
@@ -465,6 +528,8 @@ function CodePane(props: {
   searchQuery: () => string
   activeMatch: () => [number, number] | undefined
   scroll: () => ScrollBoxRenderable | undefined
+  onContextMenu: (x: number, y: number, text: string) => void
+  onDismissMenu: () => void
 }) {
   const context = usePlugin()
   let host: BoxRenderable | undefined
@@ -486,7 +551,7 @@ function CodePane(props: {
 
   onMount(() => {
     if (!host || built) return
-    const style = buildSyntaxStyle(props.theme)
+    const style = buildSyntaxStyle(props.theme, context.renderer.nativeScene)
     const code = new CodeRenderable(context.renderer, {
       content: props.content(),
       filetype: props.filetype(),
@@ -494,6 +559,27 @@ function CodePane(props: {
       fg: props.theme.text.base,
       wrapMode: "none",
       conceal: false,
+      selectionBg: props.theme.text.action.primary.base,
+      selectionFg: props.theme.background.base,
+      onMouseDown: (event) => {
+        props.onDismissMenu()
+        if (event.button !== 2) return
+        event.preventDefault()
+        const selection = context.renderer.getSelection()
+        const text = selection && built && selection.selectedRenderables.includes(built.code)
+          ? selection.getSelectedText()
+          : ""
+        if (!text.trim()) {
+          context.ui.toast.show({
+            title: "File preview",
+            message: "Drag over code to select it first",
+            variant: "info",
+            duration: 2000,
+          })
+          return
+        }
+        props.onContextMenu(event.x, event.y, text)
+      },
     })
     const wrapper = new LineNumberRenderable(context.renderer, {
       target: code,
@@ -536,15 +622,13 @@ function CodePane(props: {
     const jump = () => {
       const scroll = props.scroll()
       if (!scroll || scroll.isDestroyed || current.code.isDestroyed) return
-      const lib = resolveRenderLib()
-      const encoded = lib.encodeUnicode(position.prefix, context.renderer.widthMethod)
+      const buffer = context.renderer.currentRenderBuffer
+      const encoded = buffer.encodeUnicode(position.prefix)
       let column = 0
-      if (encoded) {
-        try {
-          for (const cell of encoded.data) column += cell.char === 9 ? 4 : cell.width
-        } finally {
-          lib.freeUnicode(encoded)
-        }
+      try {
+        for (const cell of encoded.data) column += cell.char === 9 ? 4 : cell.width
+      } finally {
+        buffer.freeUnicode(encoded)
       }
       const gutter = Math.max(3, String(countLines(props.content())).length) + 1
       scroll.scrollTo({
@@ -569,7 +653,7 @@ function DiffPane(props: {
   filetype: () => string | undefined
 }) {
   const theme = props.theme
-  const syntaxStyle = buildSyntaxStyle(theme)
+  const syntaxStyle = buildSyntaxStyle(theme, usePlugin().renderer.nativeScene)
   onCleanup(() => releaseSyntaxStyle(syntaxStyle))
   return (
     <diff
@@ -629,6 +713,8 @@ function FilePreviewDialog(props: { preview: () => FilePreview | undefined }) {
   const [searchQuery, setSearchQuery] = createSignal("")
   const [matchIndex, setMatchIndex] = createSignal(0)
   const [showGitDiff, setShowGitDiff] = createSignal(false)
+  const [menu, setMenu] = createSignal<{ left: number; top: number; text: string }>()
+  const [menuHover, setMenuHover] = createSignal(false)
   let dialogRoot: BoxRenderable | undefined
   let searchInput: InputRenderable | undefined
   let codeScroll: ScrollBoxRenderable | undefined
@@ -649,7 +735,64 @@ function FilePreviewDialog(props: { preview: () => FilePreview | undefined }) {
     })
   })
 
+  const dismissMenu = () => {
+    setMenu(undefined)
+    setMenuHover(false)
+  }
+
+  /** Opens the selection menu next to the cursor, clamped inside the dialog. */
+  const openSelectionMenu = (x: number, y: number, text: string) => {
+    const root = dialogRoot
+    const localX = x - (root && !root.isDestroyed ? Math.trunc(root.x) : 0) - 1
+    const localY = y - (root && !root.isDestroyed ? Math.trunc(root.y) : 0) - 1
+    const maxLeft = root && !root.isDestroyed ? Math.trunc(root.width) - SELECTION_MENU_WIDTH - 2 : localX
+    const maxTop = root && !root.isDestroyed ? Math.trunc(root.height) - SELECTION_MENU_HEIGHT - 2 : localY
+    setMenuHover(false)
+    setMenu({
+      left: Math.max(0, Math.min(localX, maxLeft)),
+      top: Math.max(0, Math.min(localY, maxTop)),
+      text,
+    })
+  }
+
+  /** Sends the selection to the chat composer as absolute path + fenced code. */
+  const addSelectionToChat = (text: string) => {
+    const preview = current()
+    dismissMenu()
+    if (!preview) return
+
+    const body = text.replace(/\s+$/, "")
+    const language = filetype() ?? ""
+    const payload = `${preview.node.path}\n\n\`\`\`${language}\n${body}\n\`\`\`\n`
+    if (appendToComposer(context.renderer, payload)) {
+      context.ui.dialog.clear()
+      if (composerEditor && !composerEditor.isDestroyed) composerEditor.focus()
+      context.renderer.requestRender()
+      context.ui.toast.show({
+        title: "Added to chat",
+        message: `${countLines(body)} line${countLines(body) === 1 ? "" : "s"} from ${preview.node.name}`,
+        variant: "success",
+        duration: 2000,
+      })
+      return
+    }
+
+    void copyToClipboard(payload).then(
+      () => context.ui.toast.show({
+        title: "Composer unavailable",
+        message: "Selection copied to clipboard — paste it into the chat.",
+        variant: "warning",
+      }),
+      (cause) => context.ui.toast.show({
+        title: "Copy failed",
+        message: cause instanceof Error ? cause.message : String(cause),
+        variant: "error",
+      }),
+    )
+  }
+
   const focusSearch = () => {
+    dismissMenu()
     setShowGitDiff(false)
     setSearchOpen(true)
     if (searchInput && !searchInput.isDestroyed) searchInput.focus()
@@ -663,6 +806,7 @@ function FilePreviewDialog(props: { preview: () => FilePreview | undefined }) {
   }
 
   const toggleGitDiff = () => {
+    dismissMenu()
     searchInput?.blur()
     setSearchOpen(false)
     setShowGitDiff((value) => !value)
@@ -684,7 +828,8 @@ function FilePreviewDialog(props: { preview: () => FilePreview | undefined }) {
       { bind: "ctrl+g", run: toggleGitDiff },
       { bind: "return", enabled: searchOpen, run: () => moveMatch(1) },
       { bind: "shift+return", enabled: searchOpen, run: () => moveMatch(-1) },
-      { bind: "escape", enabled: searchOpen, run: closeSearch },
+      { bind: "escape", enabled: () => Boolean(menu()), run: dismissMenu },
+      { bind: "escape", enabled: () => searchOpen() && !menu(), run: closeSearch },
     ],
   }))
 
@@ -884,6 +1029,8 @@ function FilePreviewDialog(props: { preview: () => FilePreview | undefined }) {
                   searchQuery={searchQuery}
                   activeMatch={activeMatch}
                   scroll={() => codeScroll}
+                  onContextMenu={openSelectionMenu}
+                  onDismissMenu={dismissMenu}
                 />
               </scrollbox>
             )}
@@ -983,6 +1130,9 @@ function FilePreviewDialog(props: { preview: () => FilePreview | undefined }) {
         <text fg={theme.text.muted} flexShrink={0}>
           Ctrl+G {showGitDiff() ? "file" : "git diff"}
         </text>
+        <text fg={theme.text.muted} truncate flexShrink={1} minWidth={0}>
+          drag-select · right-click chat
+        </text>
         <box flexGrow={1} minWidth={0} />
         <Show when={readyPreview()}>
           <text fg={theme.text.muted} flexShrink={0}>
@@ -1002,6 +1152,55 @@ function FilePreviewDialog(props: { preview: () => FilePreview | undefined }) {
           {languageName(filetype())}
         </text>
       </box>
+
+      <Show when={menu()}>
+        {(item) => {
+          const lines = countLines(item().text)
+          const choose = (event: TuiMouseEvent) => {
+            if (event.button !== 0) return
+            event.stopPropagation()
+            addSelectionToChat(item().text)
+          }
+          return (
+            <box
+              position="absolute"
+              left={item().left}
+              top={item().top}
+              width={SELECTION_MENU_WIDTH}
+              height={SELECTION_MENU_HEIGHT}
+              zIndex={10}
+              flexDirection="column"
+              backgroundColor={menuHover() ? theme.background.raised.high : theme.background.raised.max}
+              border={true}
+              borderStyle="rounded"
+              borderColor={menuHover() ? theme.text.action.primary.base : theme.background.raised.high}
+              onMouseUp={choose}
+              onMouseOver={() => setMenuHover(true)}
+              onMouseOut={() => setMenuHover(false)}
+            >
+              <box
+                flexDirection="row"
+                height={1}
+                flexShrink={0}
+                columnGap={1}
+                paddingLeft={1}
+                paddingRight={1}
+                backgroundColor={theme.text.action.primary.base}
+              >
+                <text fg={theme.background.base} attributes={TextAttributes.BOLD}>
+                  +
+                </text>
+                <text fg={theme.background.base} attributes={TextAttributes.BOLD} truncate>
+                  Add to chat
+                </text>
+              </box>
+              <text fg={theme.text.muted} truncate paddingLeft={2}>
+                {lines} line{lines === 1 ? "" : "s"} · path + code
+              </text>
+            </box>
+          )
+        }}
+      </Show>
     </box>
   )
 }
@@ -1199,6 +1398,7 @@ function FileTreePanel() {
     const relativePath = normalizeGitPath(path.relative(root, node.path))
 
     ensureRemoteParsers()
+    captureComposer(context.renderer)
     setPreview({ node, status: "loading", content: "", sizeBytes: 0, relativePath })
     context.ui.dialog.show(
       () => <FilePreviewDialog preview={preview} />,
