@@ -22,74 +22,82 @@ function statusFromIndexLetter(letter: string): GitStatus | undefined {
   return undefined
 }
 
+export type GitStatusSnapshot = {
+  files: Map<string, GitStatus>
+  directories: Map<string, GitStatus>
+}
+
+const STATUS_PRIORITY: GitStatus[] = ["deleted", "modified", "added", "renamed", "untracked"]
+
 /**
  * Rebases a repository-root-relative path onto the tree root. Returns `""`
- * when the path is outside the tree root (caller keeps or drops it).
+ * when the path is outside the tree root.
  */
 function fileToTreeRoot(file: string, prefix: string): string {
   if (!prefix) return file
-  return file.startsWith(prefix) ? file.slice(prefix.length) : ""
+  const head = file.slice(0, prefix.length)
+  const inside = process.platform === "win32" ? head.toLowerCase() === prefix.toLowerCase() : head === prefix
+  return inside ? file.slice(prefix.length) : ""
 }
 
 /**
- * One `git status` call for the whole repository, keyed by repo-relative POSIX
- * path. Untracked files are expanded with `--untracked-files=all` so tree rows
- * can be colored individually. Returns an empty map outside a repository.
+ * One `git status` call for the whole repository, keyed by tree-root-relative
+ * POSIX path. Untracked files are expanded with `--untracked-files=all` so tree
+ * rows can be colored individually. Each directory gets the highest-priority
+ * status found under it. Returns empty maps outside a repository.
  */
-export async function loadGitStatusSnapshot(root: string): Promise<Map<string, GitStatus>> {
+export async function loadGitStatusSnapshot(root: string): Promise<GitStatusSnapshot> {
+  const files = new Map<string, GitStatus>()
+  const directories = new Map<string, GitStatus>()
   try {
-    // Porcelain paths are relative to the repository root. When the tree is
-    // rooted in a subdirectory, only entries under it are kept and their keys
-    // are rebased to the tree root, so row lookups never collide.
-    const shownRoot = (await exec("git", ["-C", root, "rev-parse", "--show-toplevel"], {
-      cwd: root, windowsHide: true, encoding: "utf8", timeout: 10_000, maxBuffer: 1024 * 1024,
-    })).stdout.trim()
-    const shownRelative = path.relative(shownRoot, root).replaceAll("\\", "/")
-    const prefix = shownRelative && shownRelative !== "." ? `${shownRelative}/` : ""
-
-    const { stdout } = await exec("git", ["-C", root, "--literal-pathspecs", "status", "--porcelain=v1", "--untracked-files=all", "-z"], {
-      cwd: root,
-      windowsHide: true,
-      encoding: "utf8",
-      timeout: 10_000,
+    const options = { cwd: root, windowsHide: true, encoding: "utf8", timeout: 10_000 } as const
+    // Porcelain paths are relative to the repository root; `--show-prefix` is
+    // the tree root's position inside it (e.g. "sub/"), or "" at the top level.
+    const prefix = (await exec("git", ["rev-parse", "--show-prefix"], options)).stdout.replace(/\r?\n$/, "")
+    const { stdout } = await exec("git", ["status", "--porcelain=v1", "--untracked-files=all", "-z"], {
+      ...options,
       maxBuffer: 32 * 1024 * 1024,
     })
 
-    const map = new Map<string, GitStatus>()
-    const entries = stdout.split("\0").filter(Boolean)
+    const set = (file: string, status: GitStatus) => {
+      const key = fileToTreeRoot(file, prefix)
+      if (key) files.set(key, status)
+    }
+    const entries = stdout.split("\0")
     for (let index = 0; index < entries.length; index++) {
       const entry = entries[index]
       if (entry.length < 4) continue
       const x = entry[0]
       const y = entry[1]
-      const file = entry.slice(3)
-
-      const key = prefix ? fileToTreeRoot(file, prefix) : file
-      if (key === "") continue
-
-      if (x === "?" && y === "?") {
-        map.set(key.replaceAll("\\", "/"), "untracked")
-        continue
-      }
+      // Renames and copies carry the original path as the next entry. Consume
+      // it before any filtering so it is never parsed as a status entry.
+      const original = x === "R" || x === "C" || y === "R" || y === "C" ? entries[++index] : undefined
       if (x === "!" && y === "!") continue
 
-      const status = statusFromIndexLetter(x) ?? statusFromIndexLetter(y) ?? (x === "U" || y === "U" ? "modified" : undefined)
+      const status = x === "?" && y === "?"
+        ? "untracked"
+        : statusFromIndexLetter(x) ?? statusFromIndexLetter(y) ?? (x === "U" || y === "U" ? "modified" : undefined)
       if (!status) continue
-      map.set(key.replaceAll("\\", "/"), status)
-      // Renames and copies from porcelain carry the original path right after.
-      const isRename = x === "R" || x === "C" || y === "R" || y === "C"
-      if (isRename && index + 1 < entries.length) {
-        const original = fileToTreeRoot(entries[index + 1], prefix)
-        if (original !== "") map.set(original.replaceAll("\\", "/"), status)
-        index++
-      }
+      set(entry.slice(3), status)
+      if (original) set(original, status)
     }
-    return map
   } catch {
-    return new Map()
+    return { files, directories }
   }
-}
 
+  // An ancestor never ranks below its descendants, so the walk up can stop at
+  // the first directory that already has an equal or higher-priority status.
+  for (const [file, status] of files) {
+    const rank = STATUS_PRIORITY.indexOf(status)
+    for (let slash = file.lastIndexOf("/"); slash > 0; slash = file.lastIndexOf("/", slash - 1)) {
+      const directory = file.slice(0, slash)
+      const current = directories.get(directory)
+      if (current && STATUS_PRIORITY.indexOf(current) <= rank) break
+      directories.set(directory, status)
+    }
+  }
+  return { files, directories }
+}
 
 export async function loadLocalGitInfo(filePath: string): Promise<{ branch?: string; change?: FileChange }> {
   const cwd = path.dirname(filePath)
