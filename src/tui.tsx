@@ -24,7 +24,7 @@ import {
   type ScrollBoxRenderable,
 } from "@opentui/core"
 import { Plugin, usePlugin } from "@opencode/plugin/tui"
-import { loadLocalGitInfo, type FileChange } from "./preview-git.js"
+import { loadLocalGitInfo, loadGitStatusSnapshot, type FileChange, type GitStatus } from "./preview-git.js"
 import { findSearchMatches, searchPosition } from "./preview-search.js"
 
 // ---------------------------------------------------------------------------
@@ -1225,6 +1225,7 @@ function FileTreePanel() {
   const [loading, setLoading] = createSignal(true)
   const [error, setError] = createSignal<string>()
   const [preview, setPreview] = createSignal<FilePreview>()
+  const [gitStatusMap, setGitStatusMap] = createSignal<Map<string, GitStatus>>(new Map())
   const loaded = new Map<string, FileNode[]>()
   const expanded = new Set<string>()
   let treeVersion = 0
@@ -1295,7 +1296,7 @@ function FileTreePanel() {
   })
 
   const refresh = async () => {
-    treeVersion++
+    const statusVersion = ++treeVersion
     pendingOpen = undefined
     lastClick = { path: "", time: 0 }
     setLoading(true)
@@ -1310,6 +1311,61 @@ function FileTreePanel() {
     } finally {
       setLoading(false)
       setRevision((value) => value + 1)
+    }
+    void loadGitStatusSnapshot(root).then((snapshot) => {
+      if (treeVersion !== statusVersion) return // superseded by a newer refresh
+      setGitStatusMap(snapshot)
+    })
+  }
+
+  // Git status of a tree row: files map directly; a directory inherits the
+  // highest-priority status among everything under it.
+  const rowGitStatus = (node: FileNode): GitStatus | undefined => {
+    const map = gitStatusMap()
+    if (map.size === 0) return undefined
+    const relative = normalizeGitPath(path.relative(root, node.path))
+    if (relative === "") return undefined
+    if (!node.directory) return map.get(relative)
+    const prefix = `${relative}/`
+    const priority: GitStatus[] = ["deleted", "modified", "added", "renamed", "untracked"]
+    let best: { status: GitStatus; rank: number } | undefined
+    for (const [file, status] of map) {
+      if (!file.startsWith(prefix)) continue
+      const rank = priority.indexOf(status)
+      if (!best || rank < best.rank) best = { status, rank }
+      if (best.rank === 0) break
+    }
+    return best?.status
+  }
+
+  const gitStatusColor = (status: GitStatus): RGBA => {
+    const current = theme()
+    switch (status) {
+      case "added":
+        return current.diff.text.added
+      case "deleted":
+        return current.diff.text.removed
+      case "modified":
+        return current.text.feedback.warning.base
+      case "renamed":
+        return current.text.feedback.info.base
+      case "untracked":
+        return current.diff.text.added
+    }
+  }
+
+  const gitStatusGlyph = (status: GitStatus): string => {
+    switch (status) {
+      case "added":
+        return "A"
+      case "deleted":
+        return "D"
+      case "modified":
+        return "M"
+      case "renamed":
+        return "R"
+      case "untracked":
+        return "?"
     }
   }
 
@@ -1508,17 +1564,26 @@ function FileTreePanel() {
           <For each={displayed()}>
             {(item) => {
               const active = () => item.index === selected()
+              const status = () => rowGitStatus(item.node)
               const marker = () => (item.node.directory ? (expanded.has(item.node.path) ? "▾ " : "▸ ") : "  ")
+              const color = () =>
+                active()
+                  ? theme().text.action.primary.base
+                  : status()
+                    ? gitStatusColor(status()!)
+                    : theme().text.base
+              const statusPrefix = () => (status() ? `${gitStatusGlyph(status()!)} ` : "")
               return (
                 <box
                   flexDirection="row"
                   onMouseDown={(event) => handleNodeMouseDown(event, item)}
                   onMouseUp={(event) => handleNodeMouseUp(event, item)}
                 >
-                  <text fg={active() ? theme().text.action.primary.base : theme().text.base} truncate>
+                  <text fg={color()} attributes={active() ? TextAttributes.BOLD : undefined} truncate>
                     {active() ? "› " : "  "}
                     {"  ".repeat(item.node.indent)}
                     {marker()}
+                    {statusPrefix()}
                     {item.node.name}
                   </text>
                 </box>
